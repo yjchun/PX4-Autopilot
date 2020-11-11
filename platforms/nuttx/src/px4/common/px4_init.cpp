@@ -49,6 +49,103 @@
 # include <nuttx/i2c/i2c_master.h>
 #endif // CONFIG_I2C
 
+#if defined(CONFIG_SYSTEM_CDCACM)
+__BEGIN_DECLS
+#include <nuttx/wqueue.h>
+#include <builtin/builtin.h>
+
+extern int sercon_main(int c, char **argv);
+extern int serdis_main(int c, char **argv);
+__END_DECLS
+
+#include <uORB/Subscription.hpp>
+#include <uORB/topics/actuator_armed.h>
+
+static struct work_s usb_serial_work;
+static bool vbus_present_prev = false;
+
+enum class UsbAutoStartState {
+	disconnected,
+	connecting,
+	connected,
+	disconnecting,
+} usb_auto_start_state{UsbAutoStartState::disconnected};
+
+static void mavlink_usb_check(void *arg)
+{
+	int rescheduled = -1;
+
+	uORB::SubscriptionData<actuator_armed_s> actuator_armed_sub{ORB_ID(actuator_armed)};
+
+	const bool armed = actuator_armed_sub.get().armed;
+	const bool vbus_present = (board_read_VBUS_state() == PX4_OK);
+
+	if (!armed) {
+		switch (usb_auto_start_state) {
+		case UsbAutoStartState::disconnected:
+			if (vbus_present && vbus_present_prev) {
+				usb_auto_start_state = UsbAutoStartState::connecting;
+				rescheduled = work_queue(LPWORK, &usb_serial_work, mavlink_usb_check, NULL, 0);
+
+			} else if (vbus_present && !vbus_present_prev) {
+				// check again sooner is USB just connected
+				rescheduled = work_queue(LPWORK, &usb_serial_work, mavlink_usb_check, NULL, USEC2TICK(400000));
+			}
+
+			break;
+
+		case UsbAutoStartState::connecting:
+			sched_lock();
+
+			if (sercon_main(0, NULL) == EXIT_SUCCESS) {
+				static const char *mavlink_start_argv[] {"mavlink", "start", "-d", "/dev/ttyACM0", NULL};
+
+				if (exec_builtin("mavlink", (char **)mavlink_start_argv, NULL, 0) > 0) {
+					usb_auto_start_state = UsbAutoStartState::connected;
+
+				} else {
+					usb_auto_start_state = UsbAutoStartState::disconnecting;
+				}
+
+			} else {
+				// back to disconnecting
+				usb_auto_start_state = UsbAutoStartState::disconnecting;
+			}
+
+			sched_unlock();
+
+			break;
+
+		case UsbAutoStartState::connected:
+			if (!vbus_present && !vbus_present_prev) {
+				sched_lock();
+				static const char *mavlink_stop_argv[] {"mavlink", "stop", "-d", "/dev/ttyACM0", NULL};
+				exec_builtin("mavlink", (char **)mavlink_stop_argv, NULL, 0);
+				sched_unlock();
+
+				usb_auto_start_state = UsbAutoStartState::disconnecting;
+			}
+
+			break;
+
+		case UsbAutoStartState::disconnecting:
+			// serial disconnect if unused
+			serdis_main(0, NULL);
+			usb_auto_start_state = UsbAutoStartState::disconnected;
+
+			break;
+		}
+	}
+
+	vbus_present_prev = vbus_present;
+
+	if (rescheduled != PX4_OK) {
+		work_queue(LPWORK, &usb_serial_work, mavlink_usb_check, NULL, USEC2TICK(1000000));
+	}
+}
+
+#endif // CONFIG_SYSTEM_CDCACM
+
 int px4_platform_init(void)
 {
 
@@ -110,6 +207,10 @@ int px4_platform_init(void)
 	uorb_start();
 
 	px4_log_initialize();
+
+#if defined(CONFIG_SYSTEM_CDCACM)
+	work_queue(LPWORK, &usb_serial_work, mavlink_usb_check, NULL, USEC2TICK(100000));
+#endif // CONFIG_SYSTEM_CDCACM
 
 	return PX4_OK;
 }
