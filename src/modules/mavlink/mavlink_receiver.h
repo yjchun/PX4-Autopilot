@@ -129,6 +129,8 @@ public:
 	bool component_was_seen(int system_id, int component_id);
 	void print_detailed_rx_stats() const;
 
+	void enabled_message_statistics() { _message_statistics_enabled = true; }
+
 private:
 	static void *start_trampoline(void *context);
 	void run();
@@ -143,8 +145,7 @@ private:
 					 const vehicle_command_s &vehicle_command);
 
 	uint8_t handle_request_message_command(uint16_t message_id, float param2 = 0.0f, float param3 = 0.0f,
-					       float param4 = 0.0f,
-					       float param5 = 0.0f, float param6 = 0.0f, float param7 = 0.0f);
+					       float param4 = 0.0f, float param5 = 0.0f, float param6 = 0.0f, float param7 = 0.0f);
 
 	void handle_message(mavlink_message_t *msg);
 
@@ -247,7 +248,6 @@ private:
 
 	static constexpr unsigned MAX_REMOTE_COMPONENTS{8};
 	struct ComponentState {
-		uint32_t last_time_received_ms{0};
 		uint32_t received_messages{0};
 		uint32_t missed_messages{0};
 		uint8_t system_id{0};
@@ -257,6 +257,19 @@ private:
 	ComponentState _component_states[MAX_REMOTE_COMPONENTS] {};
 	unsigned _component_states_count{0};
 	bool _warned_component_states_full_once{false};
+
+
+	bool _message_statistics_enabled{false};
+
+	static constexpr int MAX_MSG_STAT_SLOTS{16};
+	struct ReceivedMessageStats {
+		float avg_rate_hz{0.f}; // average rate
+		uint32_t last_time_received_ms{0};
+		uint16_t msg_id{0};
+		uint8_t system_id{0};
+		uint8_t component_id{0};
+	};
+	ReceivedMessageStats *_received_msg_stats{nullptr};
 
 	uint64_t _total_received_counter{0};                            ///< The total number of successfully received messages
 	uint64_t _total_lost_counter{0};                                ///< Total messages lost during transmission.
