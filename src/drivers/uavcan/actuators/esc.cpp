@@ -149,7 +149,7 @@ UavcanEscController::esc_status_sub_cb(const uavcan::ReceivedDataStructure<uavca
 		ref.timestamp       = hrt_absolute_time();
 		ref.esc_voltage     = msg.voltage;
 		ref.esc_current     = msg.current;
-		ref.esc_temperature = msg.temperature;
+		ref.esc_temperature = roundf(msg.temperature * 100.f); // centidegrees
 		ref.esc_rpm         = msg.rpm;
 		ref.esc_errorcount  = msg.error_count;
 	}
