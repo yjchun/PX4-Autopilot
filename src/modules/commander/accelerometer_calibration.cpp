@@ -1,6 +1,6 @@
 /****************************************************************************
  *
- *   Copyright (c) 2013-2020 PX4 Development Team. All rights reserved.
+ *   Copyright (c) 2013-2021 PX4 Development Team. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -131,12 +131,14 @@
 #include <px4_platform_common/time.h>
 
 #include <drivers/drv_hrt.h>
+#include <include/containers/Bitset.hpp>
 #include <lib/sensor_calibration/Accelerometer.hpp>
 #include <lib/sensor_calibration/Utilities.hpp>
 #include <lib/mathlib/mathlib.h>
 #include <lib/geo/geo.h>
 #include <matrix/math.hpp>
 #include <lib/conversion/rotation.h>
+#include <lib/mathlib/math/WelfordMean.hpp>
 #include <lib/parameters/param.h>
 #include <lib/systemlib/err.h>
 #include <lib/systemlib/mavlink_log.h>
@@ -472,7 +474,6 @@ int do_accel_calibration_quick(orb_advert_t *mavlink_log_pub)
 #if !defined(CONSTRAINED_FLASH)
 	PX4_INFO("Accelerometer quick calibration");
 
-	bool param_save = false;
 	bool failed = true;
 
 	FactoryCalibrationStorage factory_storage;
@@ -482,135 +483,143 @@ int do_accel_calibration_quick(orb_advert_t *mavlink_log_pub)
 		return PX4_ERROR;
 	}
 
-	// sensor thermal corrections (optional)
-	uORB::Subscription sensor_correction_sub{ORB_ID(sensor_correction)};
-	sensor_correction_s sensor_correction{};
-	sensor_correction_sub.copy(&sensor_correction);
-
+	calibration::Accelerometer calibrations[MAX_ACCEL_SENS] {};
+	math::WelfordMean<Vector3f> mean[MAX_ACCEL_SENS] {};
+	float temperature_sum[MAX_ACCEL_SENS] {};
+	int temperature_sum_count[MAX_ACCEL_SENS] {};
 	uORB::SubscriptionMultiArray<sensor_accel_s, MAX_ACCEL_SENS> accel_subs{ORB_ID::sensor_accel};
+	px4::Bitset<MAX_ACCEL_SENS> valid_cal;
 
-	/* use the first sensor to pace the readout, but do per-sensor counts */
-	for (unsigned accel_index = 0; accel_index < MAX_ACCEL_SENS; accel_index++) {
-		sensor_accel_s arp{};
-		Vector3f accel_sum{};
-		float temperature_sum{NAN};
-		unsigned count = 0;
+	const hrt_abstime start_time = hrt_absolute_time();
 
-		while (accel_subs[accel_index].update(&arp)) {
-			// fetch optional thermal offset corrections in sensor/board frame
-			if ((arp.timestamp > 0) && (arp.device_id != 0)) {
-				Vector3f offset{0, 0, 0};
+	Vector3f accel_prev[MAX_ACCEL_SENS] {};
 
-				if (sensor_correction.timestamp > 0) {
-					for (uint8_t correction_index = 0; correction_index < MAX_ACCEL_SENS; correction_index++) {
-						if (sensor_correction.accel_device_ids[correction_index] == arp.device_id) {
-							switch (correction_index) {
-							case 0:
-								offset = Vector3f{sensor_correction.accel_offset_0};
-								break;
-							case 1:
-								offset = Vector3f{sensor_correction.accel_offset_1};
-								break;
-							case 2:
-								offset = Vector3f{sensor_correction.accel_offset_2};
-								break;
-							case 3:
-								offset = Vector3f{sensor_correction.accel_offset_3};
-								break;
-							}
-						}
-					}
-				}
+	while ((hrt_elapsed_time(&start_time) < 3_s) && (valid_cal.count() < accel_subs.advertised_count())) {
+		for (unsigned accel_index = 0; accel_index < MAX_ACCEL_SENS; accel_index++) {
+			sensor_accel_s sensor_accel;
 
-				const Vector3f accel{Vector3f{arp.x, arp.y, arp.z} - offset};
+			while (accel_subs[accel_index].update(&sensor_accel)) {
+				if ((sensor_accel.timestamp > 0) && (sensor_accel.device_id != 0)) {
+					calibrations[accel_index].set_device_id(sensor_accel.device_id);
+					calibrations[accel_index].SensorCorrectionsUpdate();
 
-				if (count > 0) {
-					const Vector3f diff{accel - (accel_sum / count)};
-
-					if (diff.norm() < 1.f) {
-						accel_sum += Vector3f{arp.x, arp.y, arp.z} - offset;
-
-						count++;
-
-						if (!PX4_ISFINITE(temperature_sum)) {
+					// temperature (if available)
+					if (PX4_ISFINITE(sensor_accel.temperature)) {
+						if (temperature_sum_count[accel_index] == 0) {
 							// set first valid value
-							temperature_sum = (arp.temperature * count);
+							temperature_sum[accel_index] = sensor_accel.temperature;
+							temperature_sum_count[accel_index] = 0;
 
 						} else {
-							temperature_sum += arp.temperature;
+							temperature_sum[accel_index] += sensor_accel.temperature;
+							temperature_sum_count[accel_index]++;
 						}
+
+					} else {
+						temperature_sum[accel_index] = NAN;
+						temperature_sum_count[accel_index] = 0;
 					}
 
-				} else {
-					accel_sum = accel;
-					temperature_sum = arp.temperature;
-					count = 1;
+					const Vector3f accel{Vector3f{sensor_accel.x, sensor_accel.y, sensor_accel.z} - calibrations[accel_index].thermal_offset()};
+
+					if ((accel - accel_prev[accel_index]).longerThan(0.5f)) {
+						mean[accel_index].reset();
+						accel_prev[accel_index] = accel;
+
+					} else {
+						mean[accel_index].update(accel);
+					}
+
+					if (mean[accel_index].count() > 300 && !mean[accel_index].variance().longerThan(0.01f)) {
+						valid_cal.set(accel_index, true);
+					}
 				}
 			}
 		}
 
-		if ((count > 0) && (arp.device_id != 0)) {
+		px4_usleep(1000);
 
-			bool calibrated = false;
-			const Vector3f accel_avg = accel_sum / count;
-			const float temperature_avg = temperature_sum / count;
+		for (unsigned accel_index = 0; accel_index < MAX_ACCEL_SENS; accel_index++) {
+			if (mean[accel_index].count() > 0) {
+				PX4_DEBUG("accel %d/%d valid %d var: %.6f", accel_index, accel_subs.advertised_count(), mean[accel_index].count(),
+					  (double)mean[accel_index].variance().length());
+			}
+		}
+	}
+
+	bool calibration_updated = false;
+
+	px4::Bitset<MAX_ACCEL_SENS> calibrated;
+
+	static constexpr float g = CONSTANTS_ONE_G;
+	matrix::Matrix<float, 6, 3> Y;
+	Y.row(0) = Vector3f{ g,  0,  0}; // ORIENTATION_TAIL_DOWN
+	Y.row(1) = Vector3f{-g,  0,  0}; // ORIENTATION_NOSE_DOWN,
+	Y.row(2) = Vector3f{ 0,  g,  0}; // ORIENTATION_LEFT,
+	Y.row(3) = Vector3f{ 0, -g,  0}; // ORIENTATION_RIGHT,
+	Y.row(4) = Vector3f{ 0,  0,  g}; // ORIENTATION_UPSIDE_DOWN,
+	Y.row(5) = Vector3f{ 0,  0, -g}; // ORIENTATION_RIGHTSIDE_UP
+
+	for (unsigned accel_index = 0; accel_index < MAX_ACCEL_SENS; accel_index++) {
+		if (valid_cal[accel_index]) {
+
+			const Vector3f accel_avg{mean[accel_index].mean()};
+
+			int closest_orientation = -1;
+			float smallest_orientation_error = INFINITY;
+
+			for (int i = 0; i < 6; i++) {
+				// assume sensor/board is in one of these orientations
+				float accel_error = (Vector3f{Y.row(i)} - accel_avg).length();
+
+				if (accel_error < smallest_orientation_error) {
+					closest_orientation = i;
+					smallest_orientation_error = accel_error;
+				}
+			}
 
 			Vector3f offset{0.f, 0.f, 0.f};
+			SquareMatrix3f scale;
+			scale.setZero();
+			scale(0, 0) = calibrations[accel_index].scale()(0);
+			scale(1, 1) = calibrations[accel_index].scale()(1);
+			scale(2, 2) = calibrations[accel_index].scale()(2);
 
-			uORB::SubscriptionData<vehicle_attitude_s> attitude_sub{ORB_ID(vehicle_attitude)};
-			attitude_sub.update();
+			if (closest_orientation != -1) {
+				PX4_INFO("assuming accel %d is orientation %s (%d)", accel_index,
+					 detect_orientation_str((enum detect_orientation_return)closest_orientation),
+					 closest_orientation);
 
-			if (attitude_sub.advertised() && attitude_sub.get().timestamp != 0) {
-				// use vehicle_attitude if available
-				const vehicle_attitude_s &att = attitude_sub.get();
-				const matrix::Quatf q{att.q};
-				const Vector3f accel_ref = q.conjugate_inversed(Vector3f{0.f, 0.f, -CONSTANTS_ONE_G});
-
-				// sanity check angle between acceleration vectors
-				const float angle = AxisAnglef(Quatf(accel_avg, accel_ref)).angle();
-
-				if (angle <= math::radians(10.f)) {
-					offset = accel_avg - accel_ref;
-					calibrated = true;
-				}
+				offset = accel_avg - (scale.I() * Vector3f{Y.row(closest_orientation)});
+				calibrated.set(accel_index, true);
 			}
 
-			if (!calibrated) {
-				// otherwise simply normalize to gravity and remove offset
-				Vector3f accel{accel_avg};
-				accel.normalize();
-				accel = accel * CONSTANTS_ONE_G;
+			const Vector3f accel_avg_calibrated{scale *(accel_avg - offset)};
 
-				offset = accel_avg - accel;
-				calibrated = true;
-			}
-
-			calibration::Accelerometer calibration{arp.device_id};
-
-			// reset cal index to uORB
-			calibration.set_calibration_index(accel_index);
-
-			if (!calibrated || (offset.norm() > CONSTANTS_ONE_G)
-			    || !PX4_ISFINITE(offset(0))
-			    || !PX4_ISFINITE(offset(1))
-			    || !PX4_ISFINITE(offset(2))) {
+			if (!calibrated[accel_index] || !accel_avg_calibrated.longerThan(CONSTANTS_ONE_G * 0.9f)
+			    || accel_avg_calibrated.longerThan(CONSTANTS_ONE_G * 1.1f)
+			    || !PX4_ISFINITE(offset(0)) || !PX4_ISFINITE(offset(1)) || !PX4_ISFINITE(offset(2))) {
 
 				PX4_ERR("accel %d quick calibrate failed", accel_index);
+				failed = true;
+				break;
 
 			} else {
-				calibration.set_offset(offset);
-				calibration.set_temperature(temperature_avg);
+				// reset cal index to uORB
+				calibrations[accel_index].set_calibration_index(accel_index);
 
-				if (calibration.ParametersSave()) {
-					calibration.PrintStatus();
-					param_save = true;
-					failed = false;
-
-				} else {
-					failed = true;
-					calibration_log_critical(mavlink_log_pub, CAL_QGC_FAILED_MSG, "calibration save failed");
-					break;
+				if (temperature_sum_count[accel_index] > 0) {
+					calibrations[accel_index].set_temperature(temperature_sum[accel_index] / temperature_sum_count[accel_index]);
 				}
+
+				calibrations[accel_index].set_calibration_index(accel_index);
+
+				if (calibrations[accel_index].set_offset(offset)) {
+					calibrations[accel_index].PrintStatus();
+					calibration_updated = true;
+				}
+
+				failed = false;
 			}
 		}
 	}
@@ -619,15 +628,29 @@ int do_accel_calibration_quick(orb_advert_t *mavlink_log_pub)
 		failed = true;
 	}
 
-	if (param_save) {
-		param_notify_changes();
-	}
-
 	if (!failed) {
+		if (calibration_updated) {
+			bool param_save = false;
+
+			for (unsigned accel_index = 0; accel_index < MAX_ACCEL_SENS; accel_index++) {
+				if (calibrated[accel_index]) {
+					if (calibrations[accel_index].ParametersSave()) {
+						param_save = true;
+					}
+				}
+			}
+
+			if (param_save) {
+				param_notify_changes();
+			}
+		}
+
+		calibration_log_info(mavlink_log_pub, CAL_QGC_DONE_MSG, sensor_name);
 		return PX4_OK;
 	}
 
 #endif // !CONSTRAINED_FLASH
 
+	calibration_log_critical(mavlink_log_pub, CAL_QGC_FAILED_MSG, sensor_name);
 	return PX4_ERROR;
 }
