@@ -50,13 +50,11 @@ message(STATUS "Building and including ${config_io_board}")
 
 include(ExternalProject)
 ExternalProject_Add(px4io_firmware
-	SOURCE_DIR ${CMAKE_SOURCE_DIR}
-	DOWNLOAD_COMMAND ""
-	UPDATE_COMMAND ""
+	DOWNLOAD_COMMAND rsync -a --no-links --exclude build --exclude=*.o --exclude=*.a ${PX4_SOURCE_DIR}/ ${PX4_BINARY_DIR}/external/Source/px4io_firmware/
+	UPDATE_COMMAND rsync -a --no-links --exclude build --exclude=*.o --exclude=*.a ${PX4_SOURCE_DIR}/ ${PX4_BINARY_DIR}/external/Source/px4io_firmware/
 	CMAKE_ARGS -DCONFIG=${config_io_board}
 	INSTALL_COMMAND ""
 	USES_TERMINAL_BUILD true
-	DEPENDS git_nuttx git_nuttx_apps
 	BUILD_ALWAYS 1
 	BUILD_BYPRODUCTS ${PX4_BINARY_DIR}/external/Build/px4io_firmware/${config_io_board}.elf
 )

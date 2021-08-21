@@ -52,14 +52,13 @@ if(config_build_bootloader)
 
 	include(ExternalProject)
 	ExternalProject_Add(bootloader_firmware
-		SOURCE_DIR ${CMAKE_SOURCE_DIR}
-		DOWNLOAD_COMMAND ""
-		UPDATE_COMMAND ""
+		DOWNLOAD_COMMAND rsync -a --no-links --exclude build --exclude=*.o --exclude=*.a ${PX4_SOURCE_DIR}/ ${PX4_BINARY_DIR}/external/Source/bootloader_firmware/
+		UPDATE_COMMAND rsync -a --no-links --exclude build --exclude=*.o --exclude=*.a ${PX4_SOURCE_DIR}/ ${PX4_BINARY_DIR}/external/Source/bootloader_firmware/
 		CMAKE_ARGS -DCONFIG=${bootloader_config}
 		INSTALL_COMMAND ""
 		USES_TERMINAL_BUILD true
-		DEPENDS git_nuttx git_nuttx_apps
 		BUILD_ALWAYS 1
+		BUILD_BYPRODUCTS ${PX4_BINARY_DIR}/external/Build/bootloader_firmware/${config_io_board}.elf
 	)
 
 	ExternalProject_Get_Property(bootloader_firmware BINARY_DIR)

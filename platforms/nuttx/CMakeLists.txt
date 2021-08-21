@@ -37,8 +37,8 @@ endif()
 
 include(cygwin_cygpath)
 
-set(NUTTX_DIR ${PX4_BINARY_DIR}/NuttX/nuttx)
-set(NUTTX_APPS_DIR ${PX4_BINARY_DIR}/NuttX/apps)
+set(NUTTX_DIR ${PX4_SOURCE_DIR}/platforms/nuttx/NuttX/nuttx)
+set(NUTTX_APPS_DIR ${PX4_SOURCE_DIR}/platforms/nuttx/NuttX/apps)
 
 add_executable(px4 ${PX4_SOURCE_DIR}/platforms/common/empty.c)
 set(FW_NAME ${PX4_BOARD_VENDOR}_${PX4_BOARD_MODEL}_${PX4_BOARD_LABEL}.elf)
@@ -126,7 +126,7 @@ target_link_libraries(px4 PRIVATE
 
 	-fno-exceptions
 	-fno-rtti
-	-Wl,--script=${PX4_BINARY_DIR_CYG}/NuttX/nuttx-config/scripts/${SCRIPT_PREFIX}script.ld
+	-Wl,--script=${NUTTX_CONFIG_DIR}/scripts/${SCRIPT_PREFIX}script.ld
 	-Wl,-Map=${PX4_CONFIG}.map
 	-Wl,--warn-common
 	-Wl,--gc-sections
